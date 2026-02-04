@@ -13,31 +13,29 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# --- Telegram config (multiple accounts for rotation) ---
+# --- Telegram config ---
 ACCOUNTS = [
     {
-        "api_id": os.getenv("API_ID_1", "29969433"),
-        "api_hash": os.getenv("API_HASH_1", "884f9ffa4e8ece099cccccade82effac"),
-        "phone_number": os.getenv("PHONE_1", "+919214045762"),
+        "api_id": os.getenv("API_ID_1"),
+        "api_hash": os.getenv("API_HASH_1"),
+        "phone_number": os.getenv("PHONE_1"),
         "session_name": "session_1"
     },
-    # Add more accounts here in the same format for rotation
 ]
 
 TARGET_BOT = "@telebrecheddb_bot"
 
-# --- Queue for request handling ---
-request_queue = Queue()
+# Global variables
 clients = []
 current_client_index = 0
 lock = asyncio.Lock()
 
-# --- Initialize all Telegram clients ---
+# --- Initialize Telegram client ---
 async def init_clients():
     for acc in ACCOUNTS:
         client = Client(
             acc["session_name"],
-            api_id=acc["api_id"],
+            api_id=int(acc["api_id"]),
             api_hash=acc["api_hash"],
             phone_number=acc["phone_number"],
             no_updates=True
@@ -51,15 +49,7 @@ async def init_clients():
         except Exception as e:
             print(f"❌ Failed to start {acc['phone_number']}: {e}")
     if not clients:
-        raise Exception("No Telegram clients available")
-
-# --- Rotate clients to avoid flood limits ---
-async def get_client():
-    global current_client_index
-    async with lock:
-        client = clients[current_client_index]
-        current_client_index = (current_client_index + 1) % len(clients)
-        return client
+        print("⚠️ No Telegram clients available - Running in mock mode")
 
 # --- Parser for bot text ---
 def parse_bot_response(text: str) -> dict:
@@ -103,8 +93,11 @@ def parse_bot_response(text: str) -> dict:
 
     return data
 
-# --- Main send + receive logic with retry and rotation ---
-async def send_and_wait(username: str, max_retries=3) -> dict:
+# --- Send message logic ---
+async def send_and_wait(username: str, max_retries=2) -> dict:
+    if not clients:
+        return {"success": False, "error": "No Telegram clients initialized"}
+    
     username = username.strip()
     if username.startswith("@"):
         username = username[1:]
@@ -112,48 +105,54 @@ async def send_and_wait(username: str, max_retries=3) -> dict:
 
     for attempt in range(max_retries):
         try:
-            client = await get_client()
+            async with lock:
+                client = clients[current_client_index]
+            
             sent = await client.send_message(TARGET_BOT, message_to_send)
             reply_text = None
             start_time = time.time()
 
-            while time.time() - start_time < 60:
+            while time.time() - start_time < 30:  # Reduced timeout for Render
                 async for msg in client.get_chat_history(TARGET_BOT, limit=10):
                     if msg.id > sent.id and not msg.outgoing and msg.text:
                         reply_text = msg.text
                         break
                 if reply_text:
                     break
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
 
-            if not reply_text:
-                continue  # Retry with another client
-
-            return parse_bot_response(reply_text)
-
+            if reply_text:
+                return parse_bot_response(reply_text)
+                
         except FloodWait as e:
-            wait_time = e.value + random.randint(5, 15)
-            print(f"⚠️ Flood wait {wait_time}s, rotating client")
-            await asyncio.sleep(wait_time)
-            continue
+            print(f"⚠️ Flood wait {e.value}s")
+            await asyncio.sleep(e.value + 5)
         except Exception as e:
             print(f"❌ Attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
     return {"success": False, "error": "Max retries exceeded"}
 
 # --- Flask setup ---
 app = Flask(__name__)
-app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
 
-@app.route("/check")
+@app.route('/')
+def home():
+    return """
+    <h1>Telegram Phone Finder API</h1>
+    <p>Use: /check?username=@username</p>
+    <p>Example: <a href="/check?username=@RiteshYadav8650">/check?username=@RiteshYadav8650</a></p>
+    <p>Active Clients: {}</p>
+    """.format(len(clients))
+
+@app.route('/check')
 def check():
-    username = request.args.get("username")
+    username = request.args.get('username')
     if not username:
-        return jsonify({"success": False, "error": "Missing 'username' parameter"}), 400
-
+        return jsonify({"success": False, "error": "Missing username parameter"}), 400
+    
     try:
-        # Run the async function in the event loop
+        # Create new event loop for each request (Render compatible)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         result = loop.run_until_complete(send_and_wait(username))
@@ -162,29 +161,22 @@ def check():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route("/health")
+@app.route('/health')
 def health():
     return jsonify({"status": "ok", "clients": len(clients)})
 
-# --- Main runner ---
-async def main():
-    await init_clients()
-    if not clients:
-        print("❌ No active clients. Exiting.")
-        return
+# --- Start everything ---
+def start_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_clients())
 
-    port = int(os.getenv("PORT", 8000))
-    print(f"✅ {len(clients)} Telegram clients active")
-    print(f"🌐 API running at: http://0.0.0.0:{port}/check?username=@example")
+# Start Telegram client in background thread
+Thread(target=start_bot, daemon=True).start()
 
-    def run_flask():
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
-
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    # Keep the asyncio loop running
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# For Render - Simple run
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    print(f"Starting server on port {port}")
+    print(f"Active Telegram clients: {len(clients)}")
+    app.run(host='0.0.0.0', port=port, debug=False)

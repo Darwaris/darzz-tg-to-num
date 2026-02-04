@@ -1,0 +1,5 @@
+pyrogram
+flask
+asyncio
+python-dotenv
+apscheduler
